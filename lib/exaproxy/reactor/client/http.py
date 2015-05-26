@@ -101,7 +101,6 @@ class HTTPClient (object):
 
 		return True,total_len
 
-
 	def _read (self, sock, max_buffer, read_size=64*1024):
 		"""Coroutine managing data read from the client"""
 		# yield request, content
@@ -111,9 +110,9 @@ class HTTPClient (object):
 		yield ''
 
 		r_buffer = ''
+		processing = False
 		nb_to_send = 0
 		seek = 0
-		processing = False
 
 		# mode can be one of : request, chunk, extension, relay
 		# request : we are reading the request (read all you can until a separator)
@@ -123,135 +122,49 @@ class HTTPClient (object):
 		# passthrough : read as much as can to be relayed
 
 		mode = 'request'
+		http_request = ''
 
 		while True:
 			try:
 				while True:
-					if not processing:
-						data = sock.recv(read_size)
-						if not data:
-							break  # read failed so we abort
-						self.log.debug("<< [%s]" % data.replace('\t','\\t').replace('\r','\\r').replace('\n','\\n'))
-						r_buffer += data
+					if processing is False:
+						new_data = sock.recv(read_size)
+						if not new_data:
+							break # read failed so we abort
 					else:
 						processing = False
 
-					if mode == 'passthrough':
-						r_buffer, tmp = '', [r_buffer]
-						yield [''], tmp
-						continue
+					r_buffer += new_data
 
-					if nb_to_send:
-						if mode == 'transfer':
-							r_len = len(r_buffer)
-							length = min(r_len, nb_to_send)
+					if mode == 'request':
+					       # check to see if we have read an entire request
+						http_request, r_buffer, seek = self.checkRequest(r_buffer, max_buffer, seek)
 
-							r_buffer, tmp = r_buffer[length:], [r_buffer[:length]]
-							_, extra_size = yield [''], tmp
+						if http_request:
+							http_request = [http_request]
+							seek = 0
 
-							r_buffer = r_buffer[length:]
-							nb_to_send = nb_to_send - length + extra_size
+							mode, nb_to_send = yield http_request, ['']
 
-							# we still have data to read before we can send more.
-							if nb_to_send != 0:
-								continue
-							mode = 'request'
-
-						if mode == 'chunked':
-							r_len = len(r_buffer)
-							length = min(r_len, nb_to_send)
-
-							# do not yield yet if we are chunked since the end of the chunk may
-							# very well be in the rest of the data we just read
-							if r_len <= nb_to_send:
-								r_buffer, tmp = r_buffer[length:], [r_buffer[:length]]
-								_, extra_size = yield [''], tmp
-
-								nb_to_send = nb_to_send - length + extra_size
-
-								# we still have data to read before we can send more.
-								if nb_to_send != 0:
-									continue
-
-					if mode == 'chunked':
-						# sum of the sizes of all chunks in our buffer
-						chunked, new_to_send = self.checkChunkSize(r_buffer[nb_to_send:])
-
-						if new_to_send is None:
-							# could not read any chunk (data is invalid)
-							break
-
-						nb_to_send += new_to_send
-						if chunked:
-							continue
-
-						mode = 'end-chunk'
-
-					# seek is only set if we already passed once and found we needed more data to check
-					if mode == 'end-chunk':
-						if r_buffer[nb_to_send:].startswith('\r\n'):
-							nb_to_send += 2
-							processing = True
-							mode = 'transfer'
-							continue
-						elif r_buffer[nb_to_send:].startswith('\n'):
-							nb_to_send += 1
-							processing = True
-							mode = 'transfer'
-							continue
-
-						if not r_buffer[nb_to_send:]:
+						elif http_request is not None:
 							yield [''], ['']
 							continue
-
-						mode = 'extra-headers'
-						seek = nb_to_send
-
-					if mode == 'extra-headers':
-						# seek is up to where we know there is no double CRLF
-						related, r_buffer, seek = self.checkRequest(r_buffer,max_buffer,seek)
-
-						if related is None:
-							# most likely could not find an header
-							break
-
-						if related:
-							tmp, related = [related], ''
-							yield [''], tmp
 
 						else:
-							yield [''], ['']
-							continue
-
-						seek = 0
-						mode = 'transfer'
-
+							break
 
 					if mode != 'request':
-						self.log.error('The programmers are monkeys - please give them bananas ..')
-						self.log.error('the mode was spelled : [%s]' % mode)
-						self.log.error('.. if it works, we are lucky - but it may work.')
-						mode = 'request'
+						# all modes that are not directly related to reading a new request
+						data, r_buffer, mode, nb_to_send, seek = self.process(r_buffer, mode, nb_to_send, max_buffer, seek)
+						if data is None:
+							break
 
-					# ignore EOL
-					r_buffer = r_buffer.lstrip('\r\n')
+						# stream data to the remote server
+						data = [data]
+						yield [''], data
 
-					# check to see if we have read an entire request
-					request, r_buffer, seek = self.checkRequest(r_buffer, max_buffer, seek)
-
-					if request is None:
-						# most likely could not find an header
-						break
-
-					if not request:
-						yield [''], ['']
-						continue
-					seek = 0
-					processing = True
-
-					# nb_to_send is how much we expect to need to get the rest of the request
-					tmp, request = [request], ''
-					mode, nb_to_send = yield tmp, ['']
+					if mode == 'request':
+						processing = True if r_buffer else False
 
 				# break out of the outer loop as soon as we leave the inner loop
 				# through normal execution
@@ -260,11 +173,102 @@ class HTTPClient (object):
 			except socket.error, e:
 				if e.args[0] in errno_block:
 					yield [''], ['']
+
 				else:
 					break
 
 		yield [None], [None]
 
+	def process (self, r_buffer, mode, nb_to_send, max_buffer, seek):
+		if mode == 'transfer':
+			return self._transfer(r_buffer, mode, nb_to_send)
+
+		if mode == 'passthrough':
+			return self._passthrough(r_buffer, mode, nb_to_send)
+
+		if mode == 'chunked':
+			data, r_buffer, new_mode, new_to_send, seek = self._chunked(r_buffer, mode, nb_to_send)
+
+		elif mode == 'end-chunk':
+			data, r_buffer, new_mode, new_to_send, seek = self._end_chunk(r_buffer, mode, nb_to_send)
+
+		elif mode == 'extra-headers':
+			data, r_buffer, new_mode, new_to_send, seek = self._extra_headers(r_buffer, mode, nb_to_send, max_buffer, seek)
+
+		else:
+			self.log.error('The programmers are monkeys - please give them bananas ..')
+			self.log.error('the mode was spelled : [%s]' % mode)
+			data, r_buffer, new_mode, new_to_send, seek = None, None, None, None, 0
+
+		if new_mode == 'transfer' and mode != 'transfer':
+			new_data, r_buffer, new_mode, new_to_send, seek = self._transfer(r_buffer, new_mode, new_to_send)
+			data += new_data
+
+		return data, r_buffer, new_mode, new_to_send, seek
+
+	def _passthrough (self, r_buffer, mode, nb_to_send):
+		return r_buffer, '', mode, nb_to_send, 0
+
+	def _transfer (self, r_buffer, mode, nb_to_send):
+		r_len = len(r_buffer)
+		length = min(r_len, nb_to_send)
+
+		r_buffer, data = r_buffer[length:], r_buffer[:length]
+		nb_to_send = nb_to_send - length
+
+		if nb_to_send == 0:
+			mode = 'request'
+
+		return data, r_buffer, mode, nb_to_send, 0
+
+	def _chunked (self, r_buffer, mode, nb_to_send):
+		r_len = len(r_buffer)
+		length = min(r_len, nb_to_send)
+
+		if nb_to_send >= r_len:
+			r_buffer, data = r_buffer[length:], r_buffer[:length]
+			nb_to_send = nb_to_send - length
+
+		else:
+			data = ''
+
+		# sum of the sizes of all chunks in our buffer
+		chunked, new_to_send = self.checkChunkSize(r_buffer[nb_to_send:])
+
+		if new_to_send is not None:
+			nb_to_send += new_to_send
+
+		else:
+			# could not read any chunk (data is invalid)
+			data = None
+
+		if not chunked:
+			mode = 'end-chunk'
+
+		return data, r_buffer, mode, nb_to_send, 0
+
+	def _end_chunk (self, r_buffer, mode, nb_to_send):
+		next_chunk = r_buffer[nb_to_send:]
+
+		for token in self.eol:
+			if next_chunk.startswith(token):
+				nb_to_send += len(token)
+				mode = 'transfer'
+				break
+
+		else:
+			mode = 'extra-headers'
+
+		return '', r_buffer, mode, nb_to_send, 0
+
+	def _extra_headers (self, r_buffer, mode, nb_to_send, max_buffer, seek):
+		# seek is up to where we know there is no double CRLF
+		related, r_buffer, seek = self.checkRequest(r_buffer, max_buffer, seek)
+
+		if related:
+			mode = 'request'
+
+		return related, r_buffer, mode, nb_to_send, seek
 
 	def setPeer (self, peer):
 		"""Set the claimed ip address for this client.

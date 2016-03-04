@@ -124,7 +124,6 @@ class Monitor (object):
 			'processes.forked' : stats['forked'],
 			'processes.min' : stats['min'],
 			'processes.max' : stats['max'],
-			'clients.silent' : len(client.norequest),
 			'clients.speaking' : len(client.byname),
 			'clients.requests' : client.total_requested,
 			'servers.opening' : len(content.opening),

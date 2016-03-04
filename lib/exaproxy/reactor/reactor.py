@@ -80,18 +80,6 @@ class Reactor (object):
 		elif source == 'web':
 			self.web.notifyClose(client)
 
-	@register('opening_client')
-	def incomingRequest (self, clients):
-		for client in clients:
-			client_id, peer, request, subrequest, data, source = self.client.readRequest(client)
-
-			if request:
-				# we have a new request - decide what to do with it
-				self.decider.sendRequest(client_id, peer, request, subrequest, source)
-
-			elif request is None and client_id is not None:
-				self.closeClient(client, source)
-
 	@register('read_client')
 	def incomingClientData (self, clients):
 		for client in clients:

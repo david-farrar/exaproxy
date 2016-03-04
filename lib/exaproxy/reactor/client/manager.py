@@ -7,7 +7,7 @@ Copyright (c) 2011-2013  Exa Networks. All rights reserved.
 """
 
 from exaproxy.util.log.logger import Logger
-from exaproxy.util.cache import TimeCache
+from exaproxy.util.active import ActiveCache
 
 from .http import HTTPClient
 from .icap import ICAPClient
@@ -18,8 +18,7 @@ class ClientManager (object):
 		self.total_sent4 = 0L
 		self.total_sent6 = 0L
 		self.total_requested = 0L
-		self.norequest = TimeCache(configuration.http.idle_connect)
-		self.bysock = {}
+		self.bysock = ActiveCache()
 		self.byname = {}
 		self.buffered = []
 		self._nextid = 0
@@ -40,29 +39,27 @@ class ClientManager (object):
 	def lookupSocket (self, item):
 		return self.byname.get(item, None)
 
-	def getnextid(self):
+	def getnextid (self):
 		self._nextid += 1
 		return str(self._nextid)
 
-	def expire (self,number=100):
-		count = 0
-		for sock in self.norequest.expired(number):
-			client = self.norequest.get(sock,[None,])[0]
-			if client:
-				self.cleanup(sock,client.name)
-				count += 1
+	def expire (self):
+		expiring = self.bysock.shift(1)
 
-		return count
+		for sock, (client, source) in expiring.iteritems():
+			self.cleanup(client)
+
+		return len(expiring)
 
 	def httpConnection (self, sock, peer, source):
 		name = self.getnextid()
 		client = HTTPClient(name, sock, peer, self.log, self.http_max_buffer, self.proxied.get(source))
 
-		self.norequest[sock] = client, source
+		self.bysock[sock] = client, source
 		self.byname[name] = sock
 
 		# watch for the opening request
-		self.poller.addReadSocket('opening_client', client.sock)
+		self.poller.addReadSocket('read_client', client.sock)
 
 		#self.log.info('new id %s (socket %s) in clients : %s' % (name, sock, sock in self.bysock))
 		return peer
@@ -71,11 +68,11 @@ class ClientManager (object):
 		name = self.getnextid()
 		client = ICAPClient(name, sock, peer, self.log, self.icap_max_buffer, self.proxied.get(source))
 
-		self.norequest[sock] = client, source
+		self.bysock[sock] = client, source
 		self.byname[name] = sock
 
 		# watch for the opening request
-		self.poller.addReadSocket('opening_client', client.sock)
+		self.poller.addReadSocket('read_client', client.sock)
 
 		#self.log.info('new id %s (socket %s) in clients : %s' % (name, sock, sock in self.bysock))
 		return peer
@@ -84,46 +81,14 @@ class ClientManager (object):
 		name = self.getnextid()
 		client = TLSClient(name, sock, peer, self.log, self.tls_max_buffer, self.proxied.get(source))
 
-		self.norequest[sock] = client, source
+		self.bysock[sock] = client, source
 		self.byname[name] = sock
 
 		# watch for the opening request
-		self.poller.addReadSocket('opening_client', client.sock)
+		self.poller.addReadSocket('read_client', client.sock)
 
 		#self.log.info('new id %s (socket %s) in clients : %s' % (name, sock, sock in self.bysock))
 		return peer
-
-	def readRequest (self, sock):
-		"""Read only the initial HTTP headers sent by the client"""
-
-		client, source = self.norequest.get(sock, (None, None))
-
-		if client:
-			name, peer, request, subrequest, content = client.readData()
-			if request:
-				self.total_requested += 1
-
-				# headers can be read only once
-				self.norequest.pop(sock, (None, None))
-				self.bysock[sock] = client, source
-
-				# watch for the client sending new data
-				self.poller.addReadSocket('read_client', client.sock)
-
-				# we have now read the client's opening request
-				self.poller.removeReadSocket('opening_client', client.sock)
-
-				# do not read more data until we have properly handled the request
-				self.poller.corkReadSocket('read_client', sock)
-
-			elif request is None:
-				self.cleanup(sock, client.name)
-		else:
-			self.log.error('trying to read headers from a client that does not exist %s' % sock)
-			name, peer, request, subrequest, content, source = None, None, None, None, None, None
-
-		return name, peer, request, subrequest, content, source
-
 
 	def readData (self, sock):
 		client, source = self.bysock.get(sock, (None, None))
@@ -139,7 +104,7 @@ class ClientManager (object):
 				self.poller.corkReadSocket('read_client', sock)
 
 			elif request is None:
-				self.cleanup(sock, client.name)
+				self.cleanup(client)
 		else:
 			self.log.error('trying to read from a client that does not exist %s' % sock)
 			name, peer, request, subrequest, content = None, None, None, None, None
@@ -155,7 +120,7 @@ class ClientManager (object):
 
 			if res is None:
 				# close the client connection
-				self.cleanup(sock, client.name)
+				self.cleanup(client)
 
 				buffered, had_buffer, sent4, sent6 = None, None, 0, 0
 				result = None
@@ -166,6 +131,11 @@ class ClientManager (object):
 				self.total_sent6 += sent6
 				result = buffered
 
+			if buffered is True and had_buffer is False:
+				assert sock not in self.buffered
+
+			elif buffered is False and had_buffer is True:
+				assert sock in self.buffered
 
 			if buffered:
 				if sock not in self.buffered:
@@ -212,7 +182,7 @@ class ClientManager (object):
 
 		return mode, nb_to_read
 
-	def startData(self, sock, data, remaining):
+	def startData (self, sock, data, remaining):
 		client, source = self.bysock.get(sock, (None, None))
 
 		try:
@@ -239,19 +209,19 @@ class ClientManager (object):
 			self.total_sent6 += sent6
 
 		else:
-			self.cleanup(client.sock, name)
+			self.cleanup(client)
 			return None, source
 
 
 		if request:
 			self.total_requested += 1
 			self.log.info('reading multiple requests')
-			self.cleanup(client.sock, name)
+			self.cleanup(client)
 			buffered, had_buffer = None, None
 			content = None
 
 		elif request is None:
-			self.cleanup(client.sock, name)
+			self.cleanup(client)
 			buffered, had_buffer = None, None
 			content = None
 
@@ -268,53 +238,44 @@ class ClientManager (object):
 		return content, source
 
 
-	def corkUpload(self, sock):
+	def corkUpload (self, sock):
 		if sock in self.bysock:
 			self.poller.corkReadSocket('read_client', sock)
 
-	def uncorkUpload(self, sock):
+	def uncorkUpload (self, sock):
 		if sock in self.bysock:
 			self.poller.uncorkReadSocket('read_client', sock)
 
-	def cleanup(self, sock, name):
-		self.log.debug('cleanup for socket %s' % sock)
-		client, source = self.bysock.get(sock, (None,None))
-		client, source = (client,None) if client else self.norequest.get(sock, (None,None))
-
-		self.bysock.pop(sock, None)
-		self.norequest.pop(sock, (None,None))
-		self.byname.pop(name, None)
-
+	def cleanup (self, client):
 		if client:
+			self.log.debug('cleanup for socket %s' % client.sock)
+			self.bysock.pop(client.sock, None)
+			self.byname.pop(client.name, None)
+
 			self.poller.removeWriteSocket('write_client', client.sock)
 			self.poller.removeReadSocket('read_client', client.sock)
-			self.poller.removeReadSocket('opening_client', client.sock)
 
 			client.shutdown()
 		else:
-			self.log.error('COULD NOT CLEAN UP SOCKET %s' % sock)
+			self.log.error('COULD NOT CLEAN UP SOCKET %s' % client.sock)
 
-		if sock in self.buffered:
-			self.buffered.remove(sock)
+		if client.sock in self.buffered:
+			self.buffered.remove(client.sock)
 
 	def softstop (self):
-		if len(self.byname) > 0 or len(self.norequest) > 0:
+		if len(self.byname) > 0:
 			return False
+
 		self.log.critical('no more client connection, exiting.')
 		return True
 
-	def stop(self):
+	def stop (self):
 		for client, source in self.bysock.itervalues():
 			client.shutdown()
 
-		for client, source in self.norequest.itervalues():
-			client.shutdown()
-
 		self.poller.clearRead('read_client')
-		self.poller.clearRead('opening_client')
 		self.poller.clearWrite('write_client')
 
 		self.bysock = {}
-		self.norequest = {}
 		self.byname = {}
 		self.buffered = []
